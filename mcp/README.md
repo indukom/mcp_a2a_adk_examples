@@ -1,0 +1,329 @@
+# Module 1 — MCP Servers (`mcp`)
+
+**Requires:** `GITHUB_TOKEN` for the GitHub demo. No API key needed for the pricing/inventory servers standalone.
+
+This module introduces **MCP (Model Context Protocol)** — the standard that lets AI agents call external tools without knowing where the data comes from.
+
+---
+
+## What this module teaches
+
+A naive negotiation agent uses hardcoded prices — the agents have no real market data and just make up numbers.
+
+MCP fixes that. It is a protocol that:
+1. Lets a server **expose tools** (functions with typed inputs/outputs)
+2. Lets a client **discover** those tools automatically (`list_tools`)
+3. Lets a client **call** those tools over a standard interface (`call_tool`)
+
+The agent doesn't need to know if the data comes from a database, an API, or a spreadsheet. It just calls the tool by name.
+
+---
+
+## File breakdown
+
+### `github_agent_client.py` — An LLM agent that uses GitHub via MCP
+
+This file connects to **GitHub's official MCP server** — hosted by GitHub at `https://api.githubcopilot.com/mcp/readonly` — and lets the LLM decide which tools to call based on your natural language query.
+
+Why GitHub? Because you already know what GitHub does. Seeing an LLM agent use MCP with a familiar tool makes the protocol click before you write your own servers.
+
+**What it demonstrates:**
+- Connecting to a **remote** MCP server over **Streamable HTTP** with a Bearer token (no local server process)
+- Discovering **all three primitives**: tools (29, read-only), resource templates (`repo://{owner}/{repo}/contents{/path*}`, ...), and prompts
+- The **host** reading a resource (a repo's README) and attaching it as context — resources are never "called" by the model
+- Converting tool schemas to OpenAI function-calling format, and the LLM **choosing** which tools to call (agentic, not scripted)
+- The ReAct-style tool loop: LLM calls tools, gets results, calls more tools or answers
+- This is the **same pattern** used by our ADK buyer/seller agents in Module 2 (via `McpToolset`)
+
+**Prerequisites:**
+- A real GitHub Personal Access Token in `.env` as `GITHUB_TOKEN` (classic or fine-grained; read access to public repos is enough)
+- An OpenAI API key
+
+```bash
+python mcp/clients/github_agent_client.py      # two sample queries: tools only, then resource + tools
+
+# Custom query (tools only):
+python mcp/clients/github_agent_client.py "Find popular MCP server implementations"
+
+# Custom query with a resource attached by the host:
+python mcp/clients/github_agent_client.py --attach repo://modelcontextprotocol/python-sdk/contents/README.md "Summarize what this SDK provides"
+```
+
+> The older `npx @modelcontextprotocol/server-github` package is deprecated and only exposed tools, so it couldn't demonstrate resources or prompts.
+
+---
+
+### `sse_agent_client.py` — SSE agent client (connects over HTTP)
+
+An LLM-powered agent that connects to the pricing and/or inventory servers running in **SSE mode** (HTTP) and lets gpt-4o-mini decide which tools to call — the same agentic pattern as `github_agent_client.py`, just a different transport.
+
+**What it demonstrates:**
+- Connecting to MCP servers via SSE (Server-Sent Events) transport
+- The LLM **choosing** which tools to call (agentic, not scripted)
+- Connecting to multiple MCP servers from a single agent
+- Proving the transport is irrelevant — same protocol, same agent loop
+
+**Prerequisites:**
+- Start the servers in SSE mode first (in separate terminals)
+- An OpenAI API key
+
+```bash
+# Terminal 1:
+python mcp/servers/pricing_server.py --sse --port 8001
+
+# Terminal 2:
+python mcp/servers/inventory_server.py --sse --port 8002
+
+# Terminal 3 — run the agent:
+python mcp/clients/sse_agent_client.py                                          # all sample queries
+python mcp/clients/sse_agent_client.py "Is this property overpriced?"            # custom query
+python mcp/clients/sse_agent_client.py --both "Use inventory and pricing data"   # both servers
+```
+
+---
+
+### `pricing_server.py` — Custom MCP server for market pricing
+
+This is the first custom MCP server. It wraps simulated real estate pricing data and exposes it as MCP tools.
+
+**Tools it exposes:**
+
+| Tool | What it does | Who uses it |
+|---|---|---|
+| `get_market_price(address, property_type)` | Returns comparable sales, estimated value, and market analysis | Both buyer and seller |
+| `calculate_discount(base_price, market_condition, days_on_market, property_condition)` | Returns suggested offer ranges and negotiation tips | Both buyer and seller |
+
+**Three transport modes (same server, different usage):**
+
+```bash
+# stdio — default, client spawns this as a subprocess (used by Module 2's ADK agents)
+python mcp/servers/pricing_server.py
+
+# SSE — HTTP server, multiple clients can connect at once
+python mcp/servers/pricing_server.py --sse --port 8001
+
+# Streamable HTTP + authentication & authorization (used by ADK demo d02)
+python mcp/servers/pricing_server.py --http            # → http://127.0.0.1:8001/mcp
+```
+
+In Module 2, the ADK negotiation agents (via `McpToolset`) start this server automatically as a subprocess. You don't need to run it manually — but you *can* to inspect it. Demo d02 connects to the `--http` mode instead.
+
+**Authentication & authorization (`--http` only):**
+
+| Layer | Rule | Failure |
+|---|---|---|
+| Authentication | Every request needs `Authorization: Bearer <JWT>`; signature, expiry, issuer and audience are checked | **401** |
+| Server authorization | The token must carry scope `pricing:read` | **403** |
+| Tool authorization | `get_market_price` needs `pricing:read`; `calculate_discount` needs `pricing:analyze` | Tool error: "forbidden: lacks scope …" |
+
+Tokens are HS256-signed JWTs minted by [`utils/pricing_auth.py`](../utils/pricing_auth.py) with the secret `PRICING_JWT_SECRET` from `.env`:
+
+```bash
+python utils/pricing_auth.py --role buyer                 # pricing:read           → print token
+python utils/pricing_auth.py --role analyst --write-env   # pricing:read + analyze → save as PRICING_MCP_TOKEN
+python utils/pricing_auth.py --role guest                 # no scopes (to see a 403)
+```
+
+> **stdio and `--sse` are not protected.** The MCP spec defines authorization only for HTTP transports — there's no HTTP request carrying a token over stdio, and a stdio server is trusted by whoever can launch the process. The same tools run without any token there.
+
+---
+
+### `inventory_server.py` — Custom MCP server for inventory + seller constraints
+
+This server simulates an MLS (Multiple Listing Service) system. It has one public tool and one **seller-only** tool.
+
+**Tools it exposes:**
+
+| Tool | What it does | Who uses it |
+|---|---|---|
+| `get_inventory_level(zip_code)` | Returns active listings, days on market, market condition | Both buyer and seller |
+| `get_minimum_acceptable_price(property_id)` | Returns the seller's absolute floor price | **Seller only** |
+
+**The information asymmetry lesson:**
+
+The buyer agent never connects to `get_minimum_acceptable_price`. This is intentional — in real estate, only the seller's agent knows the seller's walk-away price. The seller uses this tool to set a hard floor; the buyer has to negotiate without knowing it.
+
+This is the same pattern used in real production systems: MCP access control means different agents get different tools.
+
+```bash
+# stdio — default
+python mcp/servers/inventory_server.py
+
+# SSE
+python mcp/servers/inventory_server.py --sse --port 8002
+```
+
+---
+
+## MCP in one diagram
+
+```
+AGENT                       MCP Protocol              SERVER
+─────────────────           ────────────────          ──────────────────
+"What tools exist?"
+await session.list_tools() ─────────────────────────> Returns tool schemas
+                                                       [{name, description,
+                                                         inputSchema}]
+
+"Call this tool"
+await session.call_tool(    ─────────────────────────> Executes Python fn
+  "get_market_price",
+  {"address": "742..."}
+)
+                           <───────────────────────── Returns result dict
+"Comps avg $462K,
+listing is 4.9% above
+market. I'll offer $425K."
+```
+
+The agent never imports your Python functions directly. It talks to the server over the protocol — the same way whether the server is local or remote.
+
+---
+
+## How to run
+
+```bash
+# GitHub MCP agent (needs GITHUB_TOKEN + OPENAI_API_KEY in .env)
+python mcp/clients/github_agent_client.py
+
+# Inspect pricing server tools (no API key needed)
+python mcp/servers/pricing_server.py
+# Then Ctrl+C to stop (it's a server, it waits for connections)
+
+# Inspect inventory server tools (no API key needed)
+python mcp/servers/inventory_server.py
+
+# SSE mode — run in one terminal, connect from another
+python mcp/servers/pricing_server.py --sse --port 8001
+python mcp/servers/inventory_server.py --sse --port 8002
+
+# Then connect with the SSE agent client (in another terminal)
+python mcp/clients/sse_agent_client.py                    # all sample queries (pricing only)
+python mcp/clients/sse_agent_client.py --both              # includes inventory queries too
+
+# Streamable HTTP with authentication + authorization (used by ADK demo d02)
+python mcp/servers/pricing_server.py --http                # needs PRICING_JWT_SECRET in .env
+python utils/pricing_auth.py --role buyer            # mint a token (buyer | analyst | guest)
+```
+
+**What to expect from the GitHub agent:**
+- It connects to GitHub's hosted MCP server over HTTP
+- Lists the server's tools (29 read-only), resource templates (5 `repo://` URIs), and prompts (2)
+- For the second sample query, the host reads the python-sdk README as a resource and attaches it
+- The LLM decides which tools to call based on your query
+- Executes the tool calls via MCP and feeds results back
+- Produces a natural language summary
+
+**What to expect from the pricing/inventory servers:**
+- They start and wait for a client to connect
+- On their own they don't print much — they're servers
+- In Module 2, the ADK agents connect to them automatically
+
+---
+
+## Deep-dive demos (`mcp/demos/`)
+
+Standalone, runnable scripts that crack open the MCP protocol so you can see what's happening on the wire. Each one is self-contained and prints what it sends/receives. Read them in order; companion notes live in [mcp/notes/mcp_deep_dive.md](notes/mcp_deep_dive.md).
+
+| Demo | What it shows | Run |
+|---|---|---|
+| [`01_initialize_handshake.py`](demos/01_initialize_handshake.py) | Raw JSON-RPC frames of the MCP `initialize` handshake (no SDK) — capability negotiation, `notifications/initialized`, then `tools/list` | `python mcp/demos/01_initialize_handshake.py` |
+| [`02_tool_loop_trace.py`](demos/02_tool_loop_trace.py) | The full **model ↔ host ↔ server** tool-calling loop, narrated step by step with timestamps (uses the `mcp` SDK + OpenAI function calling) | `python mcp/demos/02_tool_loop_trace.py` |
+| [`03_list_all_primitives.py`](demos/03_list_all_primitives.py) | Lists **Tools, Resources, and Prompts** from both workshop servers — proves MCP carries more than just tools | `python mcp/demos/03_list_all_primitives.py` |
+| [`04_content_types.py`](demos/04_content_types.py) | A tiny inline server that returns each `Content` block kind (text / image / embedded resource) so you can see the JSON shape of each | `python mcp/demos/04_content_types.py` |
+| [`05_streamable_http_transport.py`](demos/05_streamable_http_transport.py) | Same MCP protocol, **Streamable HTTP** transport (the spec's recommended replacement for raw SSE) | Server: `python mcp/demos/05_streamable_http_transport.py --serve --port 8765`<br>Client: `python mcp/demos/05_streamable_http_transport.py --client --port 8765` |
+
+> Demos 01–04 spawn their own server subprocess — no manual setup. Only demo 05 needs two terminals.
+
+---
+
+## Inspect visually with the MCP Inspector
+
+The demos above show the protocol in your terminal. The **MCP Inspector** is the official browser-based GUI host — it connects to any MCP server and renders **Tools, Resources, and Prompts in separate tabs**, so you can *see* a generic host treat each primitive type differently (exactly what Claude Desktop does when it wires tools into the model loop, lists prompts as slash-commands, and shows resources in its attachment picker).
+
+No Python code or API key needed — it runs via `npx` (Node.js 18+). Point it at either server:
+
+```bash
+# Inventory server — 2 tools + 1 resource (inventory://floor-prices)
+npx @modelcontextprotocol/inspector python mcp/servers/inventory_server.py
+
+# Pricing server — 2 tools + 1 prompt (negotiation-tactics)
+npx @modelcontextprotocol/inspector python mcp/servers/pricing_server.py
+```
+
+> On Windows, if `python` is not the workshop venv, use its interpreter explicitly:
+> `npx @modelcontextprotocol/inspector .venv\Scripts\python.exe m1_mcp\inventory_server.py`
+
+Open the printed `http://localhost:6274?...` URL, click **Connect** (this runs the same `initialize` + `*/list` discovery as demo 03), then explore the tabs:
+
+| Tab | Try this | The lesson |
+|---|---|---|
+| **Tools** | Run `get_minimum_acceptable_price` with `742-evergreen-austin-78701` | A model-invokable action with typed args — the host gives you a form + "Run" |
+| **Resources** | Read `inventory://floor-prices` | You *read* it; there's no args form. The host never "calls" a resource |
+| **Prompts** *(pricing server)* | Render `negotiation-tactics` with `role=seller` | A user-selected template — surfaced for a human to pick, not the model |
+
+This is the visual companion to [`03_list_all_primitives.py`](demos/03_list_all_primitives.py): that script *lists* the primitives on the wire; the Inspector *renders* them the way a real host would — sorting them into tabs purely from the `type` each was declared with, with zero Inspector-specific code from you.
+
+---
+
+## Try it in a full chat host (Claude Desktop)
+
+The Inspector is a debug GUI. **Claude Desktop** is a production MCP host — wiring these servers into it shows the primitives inside a real chat, exactly as an end user would meet them.
+
+**1. Install** Claude Desktop from [claude.ai/download](https://claude.ai/download) and sign in.
+
+**2. Register the servers.** Open **Settings → Developer → Edit Config** (this opens the correct `claude_desktop_config.json`) and add an `mcpServers` block — use **absolute paths** and the **venv's** `python.exe` so the `mcp` dependency is available:
+
+```json
+{
+  "mcpServers": {
+    "real-estate-pricing": {
+      "command": "C:\\path\\to\\mcp_a2a_gcp_practice\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\mcp_a2a_gcp_practice\\mcp\\servers\\pricing_server.py"]
+    },
+    "real-estate-inventory": {
+      "command": "C:\\path\\to\\mcp_a2a_gcp_practice\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\mcp_a2a_gcp_practice\\mcp\\servers\\inventory_server.py"]
+    }
+  }
+}
+```
+
+Config file location (the **Edit Config** button always opens the right one):
+- **Windows (standalone install):** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Windows (Microsoft Store install):** `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+> JSON on Windows needs **doubled backslashes** (`\\`). If the file already has other keys (preferences, etc.), just add `mcpServers` alongside them — don't overwrite the file.
+
+**3. Fully restart** Claude Desktop — quit from the **system tray** (right-click → Quit), not just the window. Config is read only at launch.
+
+**4. Verify:** the **tools icon** in the chat input bar lists both servers and their tools; **Settings → Developer** shows each server's status (click a red one for its error log — almost always a wrong path or non-venv Python).
+
+**5. See each primitive type in a real chat:**
+- **Tool** — ask: *"What's the market price for 742 Evergreen Terrace, Austin TX 78701?"* Claude asks to run `get_market_price`, then answers from the result.
+- **Prompt** — the **`+` / attachment** menu surfaces `negotiation-tactics`; pick it, set `role=seller`, and it drops into the chat.
+- **Resource** — the same menu lets you attach `inventory://floor-prices` as context. You *attach* it — Claude never "calls" it.
+
+Same servers, same primitives you saw in the Inspector — now inside a production host.
+
+---
+
+## Exercises
+
+Three hands-on exercises designed for the **2-hour follow-up review session** held a few days after the workshop. Try them as homework; the instructor will walk through and run each solution live in class.
+
+| Exercise | Difficulty | Task |
+|---|---|---|
+| [`ex01_walk_score_tool.md`](exercises/ex01_walk_score_tool.md) | `[Starter]` | Add a `get_walk_score(zip_code)` tool to `pricing_server.py`. Restart `adk web`, ask a walkability question, watch GPT-4o auto-discover and call the new tool with zero agent-side changes. |
+| [`ex02_multi_server_agent.md`](exercises/ex02_multi_server_agent.md) | `[Core]` | Build an `LlmAgent` from scratch that connects to BOTH `pricing_server` and `inventory_server` simultaneously. Test with cross-server queries; understand how ADK merges tool catalogs across multiple `McpToolset`s. |
+| [`ex03_server_failure_handling.md`](exercises/ex03_server_failure_handling.md) | `[Core]` | Build a multi-server agent that gracefully handles MCP server crashes — detects tool failures via `after_tool_callback` and degrades with fallback responses instead of crashing. The #1 production resilience pattern. |
+
+Each solution lives in `solutions/<exercise_name>/` as a self-contained, runnable package. The instructor walks through each solution live during the review session.
+
+---
+
+## Quick mental model
+- If you want to see *how to build* an MCP server, read `pricing_server.py` (simpler, 2 tools) then `inventory_server.py` (adds the seller-only tool).
+- The `@mcp.tool()` decorator is all you need to expose a Python function as an MCP tool.
+- In Module 2, both agents use these servers — you don't need to start them manually.

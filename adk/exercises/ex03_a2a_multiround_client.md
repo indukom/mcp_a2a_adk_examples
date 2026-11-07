@@ -1,0 +1,73 @@
+# Exercise 3 — A2A Multi-Round Client `[Core]`
+
+## Goal
+
+Write a Python script that orchestrates a buyer ↔ seller negotiation **over the A2A wire protocol** — discovering both agents via their Agent Cards, threading conversations with `contextId`, and breaking the loop on `ACCEPT`.
+
+This is the production pattern: **a script that doesn't know how either agent is implemented, only that they speak A2A**.
+
+## Context
+
+In Module 2 you ran `a2a_13_orchestrated_negotiation.py` — a script that does exactly this with the a2a-sdk's `Client` (polling the buyer, streaming the seller). Today you'll write your own version from scratch, one level lower: **hand-built JSON-RPC `message/send` requests** posted with `httpx` (the wire format from demo 10). The point isn't to invent something new; it's to **internalize the wire-level pattern** so you'd recognize and write it again at work.
+
+## What you're building
+
+A standalone script `multi_round_client.py` that:
+
+1. **Discovers** both agents via `A2ACardResolver` against `http://127.0.0.1:8000`.
+2. **Drives** a multi-round negotiation:
+   - Round 1: ask the buyer for an opening offer.
+   - Round k+1: forward the buyer's offer to the seller, get the seller's response, forward the response back to the buyer for the next offer.
+3. **Threads** conversations with `contextId` — buyer has its own contextId, seller has its own. *They never share context — your script is the matchmaker.*
+4. **Terminates** on `ACCEPT` (the decision the seller recorded with its `submit_decision` tool) or after `--max-rounds` (default 5).
+5. **Logs** clearly: discovery info, each round's offer + response, final outcome.
+
+## Steps
+
+1. Write the helper `send_a2a_message(http, agent_url, text, context_id)` that:
+   - POSTs a JSON-RPC `message/send` request to `agent_url` (the `url` from the agent's card).
+   - Raises if the reply is a JSON-RPC `error` — it arrives with HTTP 200, so `raise_for_status()` won't catch it.
+   - Returns `(result_dict, new_context_id)` — the result is the Task.
+2. Write `extract_agent_text(result)` that pulls the agent's text response from `artifacts` first, then `status.message` (where a failed task puts its reason), falling back to the last agent message in `history`.
+3. Use `A2ACardResolver` to fetch both Agent Cards.
+4. Write the round loop. Maintain `buyer_context_id` and `seller_context_id` separately; pass each one back to its own agent on subsequent calls.
+5. Check each Task's `status.state`: anything other than `completed` (e.g. `failed`) ends the negotiation — see demo 14.
+6. Read the seller's decision from the Task, not from its prose. The seller records every decision with its `submit_decision` tool, and ADK puts the tool's result in `history` as a data part: `{"kind": "data", "data": {"name": "submit_decision", "response": {"recorded": "ACCEPT", "price": 450000}}}`. Break when the last one recorded is `ACCEPT`, and report its `price`. Also stop if the buyer says it will WALK AWAY.
+
+   *Why not a regex on the reply?* `\bACCEPT\b` matches *"I cannot ACCEPT $440,000"*, and "the first dollar amount" in *"With $75,000 in upgrades, I accept $446,000"* is $75,000. Structured data for code, text for humans — the same reason demo 13 reads the decision this way.
+
+## Prerequisites
+
+You need both agents running first. In a separate terminal:
+
+```bash
+adk web --a2a adk/negotiation_agents/
+```
+
+Then run your script:
+
+```bash
+python adk/solutions/ex03_a2a_multiround_client/multi_round_client.py
+```
+
+> The Agent Cards come from each agent's `agent.json`, and their `url` is `http://localhost:8000/...`. Your script posts to that `url` — that's the protocol — so if you start `adk web` on another port, update the `url` in those `agent.json` files too.
+
+## Verify
+
+- Two Agent Cards fetched and printed (name, URL, skills)
+- Each round prints: round number, buyer's text (truncated), seller's text (truncated), both contextIds
+- Buyer's contextId stays constant across rounds. Seller's contextId stays constant across rounds. They are *different* from each other.
+- Loop terminates on `ACCEPT`, a walk-away, a task that isn't `completed`, or after max rounds — clean exit either way.
+- With `adk web` stopped, the script prints a one-line "can't reach the agent" message instead of a traceback.
+
+## Reflection
+
+Your script is the **matchmaker** — neither buyer nor seller knows about the other. They just see messages from "a user" (your script).
+
+**How would you turn this matchmaker into another A2A agent itself?** What would the matchmaker's Agent Card look like? What skill would it advertise? What would change in *its* `agent.py`?
+
+This is how A2A networks scale to 5+ agents in production — every coordinator is itself an A2A-discoverable agent.
+
+---
+
+> **Solution:** see `solutions/ex03_a2a_multiround_client/` for the complete, runnable script. The instructor will walk through it live during the review session.

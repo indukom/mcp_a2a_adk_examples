@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# adk — thin wrapper: kills stale servers on 8000/8001, then runs `adk web`
+set -euo pipefail
+
+for port in 8000 8001; do
+  pids=$(lsof -ti :"$port" 2>/dev/null || true)
+  if [ -n "$pids" ]; then
+    echo "Clearing port $port (PIDs: $pids)"
+    echo "$pids" | xargs kill -9 2>/dev/null || true
+  fi
+done
+
+source "$(dirname "$0")/.venv/bin/activate"
+exec adk "$@"

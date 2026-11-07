@@ -1,0 +1,1497 @@
+# A2A Protocols
+## Agent-to-Agent Communication: How Agents Talk to Each Other
+
+> **Audience:** Engineers who have built one agent and need to connect it to *other* agents — built by other teams, in other languages, on other clouds — without sharing code or memory.
+> **Prerequisites:** Comfort with HTTP and JSON. Familiarity with [`mcp_deep_dive.md`](../../mcp/notes/mcp_deep_dive.md) helps because A2A reuses the same JSON-RPC envelope as MCP.
+> **Read this after:** Demos `a2a_10_wire_lifecycle.py` through `a2a_14_error_handling.py` in `a2a/demos/`. Seeing the wire frames first is essential.
+> **Read this next:** [`google_adk_overview.md`](google_adk_overview.md) for how ADK exposes A2A endpoints automatically via `adk web --a2a`.
+>
+> **TL;DR:**
+> 1. **A2A is the agent-level analogue of MCP.** Same JSON-RPC envelope, same well-known discovery convention. Where MCP standardizes *agent → tool*, A2A standardizes *agent → agent*. Once you know one, the other is mostly vocabulary.
+> 2. **Four objects, four operations.** Objects: Task (the unit of work), Message (one turn), Part (atomic content — TextPart / DataPart / FilePart), Artifact (durable output). Operations: discover (Agent Card), invoke (`message/send`), stream (`message/stream`), poll (`tasks/get`).
+> 3. **`contextId` threads multi-turn conversations** across stateless HTTP requests. Round 1 omits it (server assigns); rounds 2+ pass it back. This is A2A's `session_id`.
+
+---
+
+## Table of Contents
+
+1. [What A2A Actually Means](#1-what-a2a-actually-means)
+2. [A2A vs MCP — The Critical Distinction](#2-a2a-vs-mcp--the-critical-distinction)
+3. [Why No Universal Standard Yet](#3-why-no-universal-standard-yet)
+4. [Message Schema Design Principles](#4-message-schema-design-principles)
+5. [Our Real Estate A2A Protocol](#5-our-real-estate-a2a-protocol)
+6. [Message Types and the Negotiation State Machine](#6-message-types-and-the-negotiation-state-machine)
+7. [A2A Transport Options](#7-a2a-transport-options)
+8. [Error Handling in A2A Communication](#8-error-handling-in-a2a-communication)
+9. [Implementing A2A in Python](#9-implementing-a2a-in-python)
+    - [Google ADK A2A in This Repo](#91-google-adk-a2a-in-this-repo)
+10. [Production A2A Patterns](#10-production-a2a-patterns)
+11. [Common Misconceptions](#11-common-misconceptions)
+
+**Part II — The A2A Protocol Spec**
+12. [Spec Overview & Versioning](#12-spec-overview--versioning)
+13. [Agent Card](#13-agent-card)
+    - [How clients find Agent Cards — discovery strategies and registries](#131-how-clients-find-agent-cards--discovery-strategies-and-registries)
+    - [Capabilities — all four, and what each one turns on](#132-capabilities--all-four-and-what-each-one-turns-on)
+14. [Tasks, Messages, Parts, Artifacts](#14-tasks-messages-parts-artifacts)
+15. [JSON-RPC Methods (`message/send`, `message/stream`, `tasks/*`)](#15-json-rpc-methods)
+16. [Task Lifecycle and Status Updates](#16-task-lifecycle-and-status-updates)
+17. [Getting Results: Polling, Streaming and Push Notifications](#17-getting-results-polling-streaming-and-push-notifications)
+18. [Authentication and Trust](#18-authentication-and-trust)
+19. [A2A vs MCP Side-by-Side](#19-a2a-vs-mcp-side-by-side)
+
+---
+
+## 1. What A2A Actually Means
+
+**A2A (Agent-to-Agent)** refers to any communication pattern where autonomous AI agents interact directly with each other — exchanging information, delegating tasks, negotiating, or coordinating.
+
+Think of it like this:
+
+```
+HUMAN-TO-AI (H2A):
+  You: "Search for Python real estate repos"
+  Claude: "Here are 5 repos I found..."
+
+API-TO-AI (Tool Call via MCP):
+  Agent: get_market_price("742 Evergreen Terrace...")
+  MCP Server: {"list_price": 485000, "estimated_value": 462000}
+
+AGENT-TO-AGENT (A2A):
+  Buyer Agent: "I offer $425,000 for the property at 742 Evergreen Terrace"
+  Seller Agent: "I counter at $477,000. The kitchen was renovated in 2023."
+  Buyer Agent: "Acknowledged. I increase my offer to $438,000..."
+```
+
+The key distinguishing features of A2A:
+- **Both sides are autonomous AI agents** (not humans, not APIs)
+- **Both sides maintain state and goals** across multiple exchanges
+- **Messages carry context and intent**, not just data
+- **Either side can initiate**, reject, or terminate the conversation
+
+### The Phone Call Analogy
+
+Think of MCP like checking a website for information (one-way, you request, server responds).
+Think of A2A like a phone call between two people who both have goals and can say anything at any time.
+
+```
+MCP (website):              A2A (phone call):
+───────────────────         ───────────────────────────────────────
+You: GET /price             Buyer: "I'm offering $425K"
+Server: {price: 485000}     Seller: "That's too low. $477K?"
+                            Buyer: "Based on comps I've pulled, $438K"
+Done. One request.          Seller: "I can do $465K if you close in 30 days"
+                            Buyer: "Deal at $458K with 45-day close"
+                            Seller: "Agreed."
+                            [continues until agreement or deadlock]
+```
+
+---
+
+## 2. A2A vs MCP — The Critical Distinction
+
+This is one of the most common sources of confusion among new AI engineers.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  MCP = Agent ↔ External System (Tools, Data, APIs)                     │
+│                                                                         │
+│  A2A = Agent ↔ Agent (Autonomous Peers Communicating)                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Side-by-Side Comparison
+
+```
+Feature              MCP                           A2A
+────────────────     ──────────────────────────    ──────────────────────────────
+Parties              Agent + Tool Server           Agent + Agent
+Intelligence         One side (agent)              Both sides (both are agents)
+Protocol             Standardized (MCP spec)       Custom (no standard yet)
+State                Stateless per call            Stateful conversation
+Initiated by         Always the agent/client       Either agent can initiate
+Response format      Defined by MCP protocol       Agreed upon by both agents
+Purpose              Access external data/tools    Coordinate, negotiate, delegate
+Example              Agent → get stock price       Buyer ↔ Seller negotiation
+```
+
+### They Work Together
+
+In our negotiation simulator, BOTH are used simultaneously:
+
+```
+                    ┌──────────────────────────────────┐
+                    │     NEGOTIATION SESSION          │
+                    └──────────────────────────────────┘
+
+BUYER AGENT ─────────────────────────────────────────── SELLER AGENT
+    │                     A2A                               │
+    │        {"type": "OFFER", "price": 425000}             │
+    │ ─────────────────────────────────────────────────►    │
+    │                                                        │
+    │        {"type": "COUNTER", "price": 477000}           │
+    │ ◄─────────────────────────────────────────────────    │
+    │                                                        │
+    │ MCP                                                MCP │
+    ▼                                                        ▼
+PRICING                                               PRICING + INVENTORY
+SERVER                                                SERVERS
+(get_market_price)                                    (get_inventory_level,
+                                                       get_minimum_price)
+```
+
+The buyer uses **MCP** to get market data, then uses **A2A** to make an offer to the seller. The seller uses **MCP** to get inventory data, then uses **A2A** to counter. MCP and A2A are complementary, not competing.
+
+---
+
+## 3. Why No Universal Standard Yet
+
+As of 2025, there is no single dominant A2A standard (though Google announced an "Agent2Agent Protocol" specification in early 2025). Here's why this space is still evolving:
+
+### The Challenge
+
+```
+Problem 1: What do agents need to communicate?
+  ─────────────────────────────────────────────
+  Simple case: "Here is my offer price"
+  Complex case: "I'm delegating the financial analysis subtask to you.
+                 Here's the full context, here are the tools you have access to,
+                 here's what I need back, here's the deadline, here's how to
+                 report errors, here's the priority level..."
+
+Problem 2: How much state to share?
+  ──────────────────────────────────
+  • Just the message? (lightweight, loses context)
+  • Full conversation history? (context-rich, expensive)
+  • Shared memory/state object? (powerful, complex)
+
+Problem 3: Trust and verification
+  ─────────────────────────────────
+  How does Agent B know Agent A is legitimate?
+  How does Agent A know Agent B executed the task faithfully?
+
+Problem 4: Discovery
+  ─────────────────────
+  How does Agent A know Agent B exists?
+  How does Agent A know Agent B's capabilities?
+```
+
+### Current State (2025)
+
+| Approach | Status | Used By |
+|---|---|---|
+| Custom JSON schemas | Common in hand-built systems | Part I of these notes (the design ideas) |
+| A2A Protocol (open spec, started by Google) | Spec v0.3.0 is what these agents speak | Google ADK (`adk web --a2a`), a2a-sdk; the workshop's demos 10–14 |
+| OpenAI Swarm patterns | Experimental | OpenAI ecosystem |
+| Human-readable text | Simple cases | Direct LLM conversation |
+
+**Our approach**: Part I (§4–§8) designs a **custom JSON envelope** — simple enough to understand in a workshop, structured enough to show the design questions any agent protocol has to answer. The running demos then use the **A2A protocol itself** (Part II, §12–§19): Agent Cards, JSON-RPC `message/send`, Tasks, Parts and Artifacts, served by `adk web --a2a`.
+
+---
+
+## 4. Message Schema Design Principles
+
+When designing your A2A message schema, follow these principles:
+
+### Principle 1: Include Identity
+
+Every message must clearly identify who sent it and who it's for.
+
+```python
+{
+    "from_agent": "buyer_agent",   # who sent this
+    "to_agent": "seller_agent",    # who should receive it
+    "session_id": "neg_001",       # which negotiation session
+    "message_id": "msg_007",       # unique ID for deduplication
+}
+```
+
+### Principle 2: Include Temporal Context
+
+Agents need to know where they are in a conversation.
+
+```python
+{
+    "round": 3,                           # negotiation round number
+    "timestamp": "2025-01-15T10:30:00Z",  # when it was sent
+    "in_reply_to": "msg_006",             # which message this responds to
+}
+```
+
+### Principle 3: Use Intent-Typed Messages
+
+Don't just send raw text. Categorize the message intent so agents can route it correctly without LLM parsing.
+
+```python
+{
+    "message_type": "COUNTER_OFFER",  # one of: OFFER, COUNTER_OFFER, ACCEPT, REJECT, WITHDRAW, INFO
+}
+```
+
+### Principle 4: Separate Payload from Metadata
+
+Keep the "what" (payload) separate from the "how/who/when" (metadata).
+
+```python
+{
+    # Metadata (for routing and tracking)
+    "message_id": "msg_007",
+    "from_agent": "seller",
+    "to_agent": "buyer",
+    "message_type": "COUNTER_OFFER",
+    "round": 3,
+
+    # Payload (the actual content)
+    "payload": {
+        "price": 465000,
+        "conditions": ["Close within 30 days", "As-is condition"],
+        "message": "Based on the 2023 kitchen renovation, $465K is fair.",
+        "expiry_rounds": 2   # this offer expires in 2 rounds
+    }
+}
+```
+
+### Principle 5: Include Human-Readable Context
+
+The LLM on the other side needs to understand the message. Include explanatory text alongside structured data.
+
+```python
+"payload": {
+    "price": 465000,
+    "message": "We're willing to come down to $465,000. The property was recently renovated with $45K in upgrades including a new kitchen, roof (2022), and HVAC. This is our best offer given the market conditions."
+    # ↑ This is what the other agent's LLM reads and reasons about
+}
+```
+
+---
+
+## 5. Our Real Estate A2A Protocol
+
+### Complete Message Schema
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal, Optional
+from datetime import datetime
+import uuid
+
+MessageType = Literal[
+    "OFFER",          # Buyer makes initial or updated offer
+    "COUNTER_OFFER",  # Seller responds with counter-offer
+    "ACCEPT",         # Either party accepts current offer
+    "REJECT",         # Either party rejects and exits negotiation
+    "WITHDRAW",       # Buyer withdraws their offer (walk-away)
+    "INFO_REQUEST",   # Agent requests more information
+    "INFO_RESPONSE",  # Agent provides requested information
+]
+
+class NegotiationPayload(BaseModel):
+    """The actual negotiation content."""
+    price: Optional[float] = None          # Offer/counter price in USD
+    conditions: list[str] = []             # ["Contingent on inspection", ...]
+    message: str                           # Human-readable explanation from agent
+    closing_timeline_days: Optional[int] = None  # Proposed closing timeline
+    concessions: list[str] = []            # ["Seller pays closing costs", ...]
+    expiry_rounds: Optional[int] = None    # How many rounds until this offer expires
+
+class A2AMessage(BaseModel):
+    """A2A message between negotiation agents."""
+    # Identity
+    message_id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:8]}")
+    session_id: str                        # Identifies this negotiation session
+    from_agent: Literal["buyer", "seller"]
+    to_agent: Literal["buyer", "seller"]
+
+    # Temporal context
+    round: int
+    timestamp: str = Field(
+        default_factory=lambda: datetime.utcnow().isoformat() + "Z"
+    )
+    in_reply_to: Optional[str] = None     # message_id of the message being replied to
+
+    # Intent
+    message_type: MessageType
+
+    # Content
+    payload: NegotiationPayload
+```
+
+### Example Message Exchange
+
+```python
+# Round 1: Buyer makes initial offer
+offer_1 = A2AMessage(
+    session_id="neg_austin_742",
+    from_agent="buyer",
+    to_agent="seller",
+    round=1,
+    message_type="OFFER",
+    payload=NegotiationPayload(
+        price=425000,
+        conditions=["Contingent on home inspection", "Financing contingency (30 days)"],
+        closing_timeline_days=45,
+        message=(
+            "We've analyzed recent comparable sales in the 78701 zip code. "
+            "The average comp price is $462,000, suggesting the property is "
+            "listed approximately 4.9% above market value. We offer $425,000 "
+            "which reflects this analysis along with the property's age (2005). "
+            "We're serious buyers with pre-approval in hand."
+        )
+    )
+)
+
+# Round 1: Seller counters
+counter_1 = A2AMessage(
+    session_id="neg_austin_742",
+    from_agent="seller",
+    to_agent="buyer",
+    round=1,
+    in_reply_to=offer_1.message_id,
+    message_type="COUNTER_OFFER",
+    payload=NegotiationPayload(
+        price=477000,
+        conditions=["As-is sale (no repairs)", "Closing within 30 days"],
+        closing_timeline_days=30,
+        message=(
+            "Thank you for your offer. However, $425,000 significantly undervalues "
+            "this property. The kitchen was fully renovated in 2023 ($45,000 upgrade), "
+            "and the roof was replaced in 2022. Current inventory in 78701 shows "
+            "only 2.1 months of supply — a seller's market. We counter at $477,000, "
+            "which we believe is fair given these improvements."
+        )
+    )
+)
+
+# Round 2: Buyer increases
+offer_2 = A2AMessage(
+    session_id="neg_austin_742",
+    from_agent="buyer",
+    to_agent="seller",
+    round=2,
+    in_reply_to=counter_1.message_id,
+    message_type="OFFER",
+    payload=NegotiationPayload(
+        price=438000,
+        conditions=["Contingent on inspection", "Financing contingency (21 days)"],
+        closing_timeline_days=40,
+        message=(
+            "We acknowledge the renovations add value. Adjusting our offer to $438,000, "
+            "which is $7,000 above the average comp and reflects the kitchen upgrade. "
+            "We've shortened our financing contingency to 21 days to make this more "
+            "attractive. We're willing to be flexible on closing date."
+        )
+    )
+)
+
+# Agreement reached!
+acceptance = A2AMessage(
+    session_id="neg_austin_742",
+    from_agent="seller",
+    to_agent="buyer",
+    round=4,
+    in_reply_to="msg_previous",
+    message_type="ACCEPT",
+    payload=NegotiationPayload(
+        price=452000,
+        conditions=["Standard inspection", "30-day financing"],
+        closing_timeline_days=35,
+        message="We accept $452,000. Congratulations, we have a deal!"
+    )
+)
+```
+
+---
+
+## 6. Message Types and the Negotiation State Machine
+
+A2A conversations need a **state machine** to track what messages are valid at each point.
+
+### State Machine Diagram
+
+```
+                        START
+                          │
+                          ▼
+                    ┌──────────┐
+                    │  BUYER   │ ── sends OFFER ──►
+                    │  THINKS  │
+                    └──────────┘
+                                         │
+                                         ▼
+                                   ┌──────────┐
+                                   │  SELLER  │
+                                   │  THINKS  │
+                                   └──────────┘
+                                         │
+                          ┌──────────────┼──────────────────┐
+                          │              │                    │
+                          ▼              ▼                    ▼
+                   COUNTER_OFFER      ACCEPT               REJECT
+                          │              │                    │
+                          ▼              ▼                    ▼
+                    ┌──────────┐   ┌──────────┐        ┌──────────┐
+                    │  BUYER   │   │ AGREED   │        │  DEAL    │
+                    │  THINKS  │   │ 🎉 DONE  │        │  DEAD    │
+                    └──────────┘   └──────────┘        └──────────┘
+                          │
+              ┌───────────┼───────────────┐
+              │           │               │
+              ▼           ▼               ▼
+          NEW OFFER    ACCEPT          WITHDRAW
+              │           │               │
+              ▼           ▼               ▼
+         (continue)   AGREED 🎉       DEAL DEAD ❌
+              │
+         (if round >= 5)
+              │
+              ▼
+          DEADLOCK ⏱️
+```
+
+### Valid Message Transitions
+
+```python
+VALID_RESPONSES: dict[MessageType, list[MessageType]] = {
+    "OFFER": ["COUNTER_OFFER", "ACCEPT", "REJECT"],
+    "COUNTER_OFFER": ["OFFER", "ACCEPT", "REJECT", "WITHDRAW"],
+    "ACCEPT": [],                    # Terminal state
+    "REJECT": [],                    # Terminal state
+    "WITHDRAW": [],                  # Terminal state
+    "INFO_REQUEST": ["INFO_RESPONSE"],
+    "INFO_RESPONSE": ["OFFER", "COUNTER_OFFER", "ACCEPT"],
+}
+
+TERMINAL_STATES = {"ACCEPT", "REJECT", "WITHDRAW"}
+```
+
+### State Machine Implementation
+
+```python
+class NegotiationStateMachine:
+    """
+    Enforces valid A2A message sequences in the negotiation.
+    Prevents agents from sending invalid messages (e.g., accepting
+    before any offer has been made).
+    """
+
+    def __init__(self, max_rounds: int = 5):
+        self.current_round = 0
+        self.max_rounds = max_rounds
+        self.last_message_type: Optional[MessageType] = None
+        self.is_terminal = False
+
+    def validate_message(self, message: A2AMessage) -> tuple[bool, str]:
+        """Returns (is_valid, reason_if_invalid)."""
+
+        if self.is_terminal:
+            return False, "Negotiation has already concluded"
+
+        if self.current_round >= self.max_rounds and message.message_type not in TERMINAL_STATES:
+            return False, f"Maximum rounds ({self.max_rounds}) reached. Only terminal messages allowed."
+
+        if self.last_message_type is not None:
+            valid_next = VALID_RESPONSES.get(self.last_message_type, [])
+            if message.message_type not in valid_next:
+                return False, (
+                    f"Cannot send {message.message_type} after {self.last_message_type}. "
+                    f"Valid responses: {valid_next}"
+                )
+
+        return True, "Valid"
+
+    def record_message(self, message: A2AMessage) -> None:
+        """Update state after a valid message is sent."""
+        self.last_message_type = message.message_type
+        if message.from_agent == "buyer":
+            self.current_round += 1
+        if message.message_type in TERMINAL_STATES:
+            self.is_terminal = True
+```
+
+### Why the Naive Approach Breaks: The while True Problem
+
+Before you saw the state machine above, you probably would have written the negotiation loop like this:
+
+```python
+# Naive approach — DO NOT DO THIS
+
+while True:
+    response = seller.respond_to_offer(buyer_message)
+    if "DEAL" in response.upper():   # Fragile: "DEAL-breaker" also matches!
+        break
+    if "REJECT" in response.upper():
+        break
+    if turn > 100:                   # Emergency exit, not a guarantee
+        break
+```
+
+**Three problems in 8 lines:**
+
+1. **String matching for termination** — `"DEAL"` matches "DEAL-breaker", "DEAL with it", etc. You're relying on the LLM to spell a specific word correctly every time.
+
+2. **No guarantee** — if the buyer max price < seller min price, agents negotiate *forever* (until turn 100). This wastes tokens and money.
+
+3. **Emergency exit is a band-aid** — "stop at 100 turns" is not a proof of termination, it's an arbitrary cutoff.
+
+### The FSM Solution: Termination By Design
+
+An FSM solves this with explicit terminal states:
+
+```python
+# FSM approach — the correct pattern
+
+class NegotiationFSM:
+    TRANSITIONS = {
+        NegotiationState.IDLE:        {NegotiationState.NEGOTIATING, NegotiationState.FAILED},
+        NegotiationState.NEGOTIATING: {NegotiationState.NEGOTIATING, NegotiationState.AGREED, NegotiationState.FAILED},
+        NegotiationState.AGREED:      set(),    # ← TERMINAL: no outgoing transitions
+        NegotiationState.FAILED:      set(),    # ← TERMINAL: no outgoing transitions
+    }
+```
+
+**The guarantee:** `AGREED` and `FAILED` have **empty transition sets**. There is no code path that can exit a terminal state — not even a bug.
+
+### Progression: FSM → ADK Workflow Agents
+
+ADK workflow agents (`LoopAgent`, `SequentialAgent`, `ParallelAgent`) **are** state machines — but for entire multi-agent flows. The same termination principle applies: bounded iteration + explicit terminal predicates.
+
+```
+FSM pattern                            ADK (LoopAgent / SequentialAgent)
+───────────────────────────        ───────────────────────────────────
+NegotiationFSM                     LoopAgent(max_iterations=N)
+  .state = NEGOTIATING               escalation/break-out via callbacks
+  .process_turn()                    sub_agents run per iteration
+  AGREED/FAILED = terminal           terminal state via session.state
+  max_turns check                    max_iterations bound
+
+Guarantees termination              Guarantees termination
+at agent level                      at agent-orchestration level
+```
+
+**See this principle in ADK:**
+```bash
+adk web adk/negotiation_agents/  # ← bounded iteration + explicit escalation
+```
+
+---
+
+## 7. A2A Transport Options
+
+How do agents physically exchange messages? Several options depending on your architecture.
+
+### Option 1: In-Process (Simplest)
+
+```python
+# Both agents live in the same Python process and share state directly.
+# No network, no serialization overhead.
+
+# A simple in-process bus / shared dict can carry envelopes:
+state = {
+    "buyer_message": None,   # buyer → seller
+    "seller_message": None,  # seller → buyer
+    "history": [],
+}
+
+def buyer_step(state):
+    last_seller_msg = state.get("seller_message")  # read seller's last envelope
+    new_offer = create_offer(...)
+    state["buyer_message"] = new_offer             # publish buyer's envelope
+    state["history"].append(new_offer)
+```
+
+**Best for**: Single-process simulations, workshops, testing.
+
+### Option 2: HTTP/REST (Microservices)
+
+```python
+# Each agent runs as a FastAPI service
+# Agents call each other's REST endpoints
+
+# buyer service
+@app.post("/receive_counter_offer")
+async def receive_counter(message: A2AMessage) -> A2AMessage:
+    # Agent processes the counter offer
+    new_offer = await buyer_agent.decide_response(message)
+    return new_offer
+
+# seller service (sending to buyer)
+response = requests.post(
+    "http://buyer-agent:8000/receive_counter_offer",
+    json=counter_offer.dict()
+)
+```
+
+**Best for**: Microservice architectures, separate agent teams, horizontal scaling.
+
+The A2A protocol is a standardized version of this option: JSON-RPC 2.0 over HTTP(S), with Server-Sent Events for streaming and a published Agent Card instead of hand-agreed endpoints (Part II).
+
+### Option 3: Message Queue (Production)
+
+```python
+# Agents publish to and subscribe from message queues
+# Decoupled, reliable, supports retry
+
+import asyncio
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
+
+# Buyer publishes offers
+async def send_offer(offer: A2AMessage):
+    producer = AIOKafkaProducer(bootstrap_servers="kafka:9092")
+    await producer.start()
+    await producer.send("negotiation.offers", offer.json().encode())
+    await producer.stop()
+
+# Seller subscribes to offers
+async def listen_for_offers():
+    consumer = AIOKafkaConsumer("negotiation.offers", bootstrap_servers="kafka:9092")
+    async for msg in consumer:
+        offer = A2AMessage.parse_raw(msg.value)
+        response = await seller_agent.respond(offer)
+        await send_counter(response)
+```
+
+**Best for**: Production systems, high volume, fault tolerance requirements.
+
+---
+
+## 8. Error Handling in A2A Communication
+
+A2A communication can fail in ways that direct API calls don't. Plan for:
+
+### Error Categories
+
+```
+1. MESSAGE VALIDATION ERRORS
+   Agent sent an invalid message (wrong type for this state,
+   missing required fields, invalid price)
+   → Response: Send ERROR message with explanation
+
+2. AGENT REASONING ERRORS
+   LLM failed to generate a valid structured response
+   (hallucinated wrong format, token limit hit)
+   → Response: Retry with simpler prompt, or report failure
+
+3. COMMUNICATION FAILURES
+   Network error, timeout, agent crashed
+   → Response: Retry with exponential backoff, or deadlock
+
+4. NEGOTIATION DEADLOCK
+   Max rounds reached with no agreement
+   → Response: Terminal DEADLOCK state, report to orchestrator
+
+5. INVALID NEGOTIATION MOVE
+   Agent tries to accept when it shouldn't, or offers above budget
+   → Response: Override or reject the move at orchestrator level
+```
+
+### Error Message Schema
+
+```python
+class ErrorPayload(BaseModel):
+    error_code: str          # "INVALID_OFFER" | "AGENT_FAILURE" | "TIMEOUT"
+    error_message: str       # Human-readable explanation
+    recoverable: bool        # Can the negotiation continue?
+    suggested_action: str    # What the other party should do
+
+# Example
+error_msg = A2AMessage(
+    session_id="neg_001",
+    from_agent="buyer",
+    to_agent="seller",
+    round=3,
+    message_type="INFO",
+    payload=NegotiationPayload(
+        message="ERROR: Our financing fell through. We need to pause negotiations."
+    )
+)
+```
+
+### What errors look like on the wire (demo 14)
+
+The categories above are about the *negotiation*. Underneath, the A2A call
+itself can fail at four layers, and each reaches the client differently
+(a2a-sdk 0.3 `Client`; all observed in `a2a_14_error_handling.py`):
+
+| Layer | How it arrives | Examples observed |
+|---|---|---|
+| Transport | Exception: `A2AClientHTTPError` (`.status_code`), `A2AClientTimeoutError` | Agent not running → 503 from the card resolver; unknown agent path → 404; blocking `message/send` past the read timeout |
+| Protocol | Exception: `A2AClientJSONRPCError` (`.error.code`, `.error.message`); on the wire, HTTP 200 with a JSON-RPC `error` object | -32001 task not found; -32002 task not cancelable; -32601 method not found; -32602 invalid params (with field details); -32603 for "Streaming / Push notifications are not supported by the agent" |
+| Task | No exception: the Task's `status.state` is `failed`, reason in `status.message` | A FilePart (`application/zip`) the model can't read |
+| Application | No exception, state `completed` — the content says the agent couldn't do it | An offer with no price: the seller asks for clarification and records no decision |
+
+Two practical rules: retry only what's transient (connection errors, 5xx);
+and for long work, don't block — a timed-out blocking call leaves the task
+running on the server with no taskId on the client. Send with
+`blocking: false` and poll `tasks/get` (or stream, or push — §17).
+
+The spec defines dedicated codes for unsupported features (-32003 push
+notifications not supported, -32004 unsupported operation); a2a-sdk
+0.3.26's server returned -32603 with a descriptive message instead, so
+check the message as well as the code.
+
+---
+
+## 9. Implementing A2A in Python
+
+For the production protocol transport in this workshop, use `adk web --a2a`.
+Here's a minimal in-process routing pattern for learning:
+
+### Message Router
+
+```python
+class A2AMessageBus:
+    """
+    Simple in-process message bus for A2A communication.
+    In production, this would be replaced by HTTP endpoints or a message queue.
+    """
+
+    def __init__(self):
+        self._queues: dict[str, list[A2AMessage]] = {
+            "buyer": [],
+            "seller": []
+        }
+        self.history: list[A2AMessage] = []
+
+    def send(self, message: A2AMessage) -> None:
+        """Route a message to the recipient agent's queue."""
+        # Validate message
+        is_valid, reason = validate_message(message)
+        if not is_valid:
+            raise ValueError(f"Invalid A2A message: {reason}")
+
+        # Route to recipient
+        self._queues[message.to_agent].append(message)
+        self.history.append(message)
+
+    def receive(self, agent_name: str) -> Optional[A2AMessage]:
+        """Get next message for an agent. Returns None if queue is empty."""
+        queue = self._queues.get(agent_name, [])
+        if queue:
+            return queue.pop(0)
+        return None
+
+    def has_messages(self, agent_name: str) -> bool:
+        """Check if agent has pending messages."""
+        return len(self._queues.get(agent_name, [])) > 0
+```
+
+### Using the Message Bus
+
+```python
+async def run_negotiation():
+    bus = A2AMessageBus()
+    buyer = BuyerAgent(budget=460000)
+    seller = SellerAgent(minimum_price=445000)
+
+    # Buyer makes first move
+    initial_offer = await buyer.make_initial_offer()
+    bus.send(initial_offer)
+
+    for round_num in range(1, 6):  # max 5 rounds
+        # Seller receives and responds
+        buyer_message = bus.receive("seller")
+        if buyer_message.message_type in ["ACCEPT", "REJECT", "WITHDRAW"]:
+            break
+
+        seller_response = await seller.respond(buyer_message)
+        bus.send(seller_response)
+
+        if seller_response.message_type in ["ACCEPT", "REJECT"]:
+            break
+
+        # Buyer receives and responds
+        seller_message = bus.receive("buyer")
+        buyer_response = await buyer.respond(seller_message)
+        bus.send(buyer_response)
+
+    return bus.history
+```
+
+### 9.1 Google ADK A2A in This Repo
+
+The idiomatic way to run A2A in this repo:
+
+```bash
+# Terminal 1 — start agents with A2A endpoints
+adk web --a2a adk/negotiation_agents/
+
+# Terminal 2 — see the wire format and task lifecycle
+python a2a/demos/a2a_10_wire_lifecycle.py \
+    --seller-url http://127.0.0.1:8000/a2a/seller_agent
+
+# Terminal 2 — see context threading across rounds
+python a2a/demos/a2a_11_context_threading.py \
+    --seller-url http://127.0.0.1:8000/a2a/seller_agent
+
+# Terminal 2 — see multi-part messages and artifacts
+python a2a/demos/a2a_12_parts_and_artifacts.py \
+    --seller-url http://127.0.0.1:8000/a2a/seller_agent
+
+# Terminal 2 — orchestrated negotiation: buyer polled, seller streamed
+python a2a/demos/a2a_13_orchestrated_negotiation.py
+
+# Terminal 2 — errors at four layers (transport, protocol, task, application)
+python a2a/demos/a2a_14_error_handling.py
+
+```
+
+Key files:
+- `adk/negotiation_agents/buyer_agent/agent.py` (buyer LlmAgent + McpToolset)
+- `adk/negotiation_agents/seller_agent/agent.py` (seller LlmAgent + dual McpToolsets)
+- `adk/negotiation_agents/negotiation/agent.py` (LoopAgent + SequentialAgent)
+- `a2a/demos/a2a_10_wire_lifecycle.py` (Agent Card + the HTTP bytes of `message/send` + the Task taken apart)
+- `a2a/demos/a2a_11_context_threading.py` (contextId threading; taskId vs contextId)
+- `a2a/demos/a2a_12_parts_and_artifacts.py` (multi-part messages; history vs status.message vs artifacts)
+- `a2a/demos/a2a_13_orchestrated_negotiation.py` (buyer polled, seller streamed — chosen from each Agent Card)
+- `a2a/demos/a2a_14_error_handling.py` (transport, protocol, task and application errors)
+
+---
+
+## 10. Production A2A Patterns
+
+### Pattern 0: The Matchmaker (Most Common)
+
+The most common production A2A topology is **a non-agent orchestrator
+script that bridges two A2A peers**. The script discovers each peer via
+its Agent Card, sends `message/send` requests in alternation, and
+threads each side's conversation with its own `contextId`.
+
+This is the "matchmaker" pattern. **The two agents never know about each
+other.** They each see only messages from "a user" (the script). The
+script is the only thing that knows about both.
+
+```python
+# Pseudocode for the matchmaker pattern.
+# Full working example: a2a_13_orchestrated_negotiation.py
+
+# 1) Discover both peers via Agent Cards.
+buyer_card  = await A2ACardResolver(http, base_url=BUYER_URL).get_agent_card()
+seller_card = await A2ACardResolver(http, base_url=SELLER_URL).get_agent_card()
+
+# 2) Maintain SEPARATE contextIds. Each agent has its own conversation thread.
+buyer_context_id, seller_context_id = None, None
+
+# 3) Loop: ask buyer → forward to seller → break on ACCEPT.
+for round_num in range(1, MAX_ROUNDS + 1):
+    buyer_text, buyer_context_id = await send_message(
+        http, buyer_card.url, prompt_for_buyer, buyer_context_id
+    )
+    seller_text, seller_context_id = await send_message(
+        http, seller_card.url, f"Buyer offered: {buyer_text}", seller_context_id
+    )
+    if has_acceptance(seller_text):
+        break
+```
+
+**Why this is the production default**, even when "everything is an agent":
+
+- **No special access required.** The matchmaker doesn't need a Python
+  import of either agent's code — just network access to their A2A
+  endpoints. Agents written in different languages, by different teams,
+  in different processes work the same way.
+- **Central place for policy.** Logging, audit, retries, rate limiting,
+  and human-in-the-loop gates all live in the matchmaker. Modifying
+  either agent is unnecessary.
+- **Substitutable.** Swap in a different buyer or different seller — as
+  long as they speak A2A and present compatible skills, the matchmaker
+  works unchanged. *This is what the protocol buys you.*
+
+**Matchmaker → A2A agent.** The matchmaker can itself be wrapped as an
+A2A agent — give it an Agent Card with skill `negotiation_orchestration`
+and serve it over `adk web --a2a`. Now *its* clients discover *it* via
+its card, call it like any other A2A peer, and the two agents under it
+remain hidden behind the abstraction. **Recursion all the way down** is
+how A2A networks scale beyond two agents.
+
+Compare to:
+- **Mediator (Pattern 2 below)** — the mediator is *itself* an LLM agent
+  that *participates* in the conversation, often when buyer and seller
+  deadlock. Different role; not a matchmaker.
+- **Peer-to-peer A2A** — the buyer agent discovers the seller's card
+  directly and sends messages without an intermediary. Possible but rare;
+  usually the matchmaker pattern wins because it centralizes policy.
+
+### Pattern 1: Agent Registry
+
+In production, agents need to find each other without hard-coded URLs. A
+registry stores Agent Cards and answers queries such as "agents with skill
+tag `seller`". The A2A spec does not define a registry API — see
+[§13.1](#131-how-clients-find-agent-cards--discovery-strategies-and-registries)
+for the discovery strategies and real registries (Google Cloud Agent
+Registry, AGNTCY Agent Directory). Conceptually:
+
+```python
+# 1. Agents publish their real A2A Agent Card (the same JSON served at
+#    /.well-known/agent-card.json) to the registry.
+# 2. A client queries by skill, tag, or keyword:
+cards = registry.search(tags=["seller"])          # API differs per registry
+card = cards[0]
+# 3. The client uses the returned card exactly like a fetched one:
+client = ClientFactory(ClientConfig(httpx_client=http)).create(card)   # uses card.url, card.capabilities, ...
+```
+
+### Pattern 2: Mediator Agent
+
+When two agents reach deadlock, a mediator agent can help:
+
+```python
+class MediatorAgent:
+    """
+    A third agent that intervenes when buyer and seller can't agree.
+    This is an A2A pattern where a third agent joins the negotiation.
+    """
+
+    async def mediate(
+        self,
+        buyer_final_offer: float,
+        seller_final_counter: float,
+        negotiation_history: list[A2AMessage]
+    ) -> A2AMessage:
+        """Propose a compromise based on both parties' positions."""
+
+        # LLM analyzes the full history to find a fair midpoint
+        midpoint = (buyer_final_offer + seller_final_counter) / 2
+
+        prompt = f"""
+        A real estate negotiation has stalled:
+        - Buyer's final offer: ${buyer_final_offer:,.0f}
+        - Seller's final ask: ${seller_final_counter:,.0f}
+        - Gap: ${seller_final_counter - buyer_final_offer:,.0f}
+
+        Full negotiation history: {[m.dict() for m in negotiation_history]}
+
+        Propose a fair settlement price with justification.
+        The mathematical midpoint is ${midpoint:,.0f}.
+        """
+
+        settlement = await self.llm.propose_settlement(prompt)
+        return A2AMessage(
+            from_agent="mediator",
+            to_agent="both",
+            message_type="SETTLEMENT_PROPOSAL",
+            payload=NegotiationPayload(
+                price=settlement.price,
+                message=settlement.justification
+            )
+        )
+```
+
+### Pattern 3: Delegation
+
+One agent delegates a subtask to a specialist agent:
+
+```python
+# Buyer agent delegates property research to a specialist
+delegation_message = A2AMessage(
+    from_agent="buyer",
+    to_agent="research_agent",
+    message_type="TASK_DELEGATION",
+    payload=NegotiationPayload(
+        message=(
+            "Please research 742 Evergreen Terrace, Austin TX 78701. "
+            "I need: (1) comparable sales in last 90 days, "
+            "(2) neighborhood crime statistics, "
+            "(3) school district rating, "
+            "(4) flood zone status. "
+            "Report back before my next negotiation round."
+        )
+    )
+)
+```
+
+---
+
+## 11. Common Misconceptions
+
+### ❌ "A2A means agents talk in natural language"
+
+**Reality**: While agents CAN communicate in natural language (one LLM sends text to another), structured JSON messages are far more reliable in production. Natural language is ambiguous; JSON is not.
+
+### ❌ "A2A replaces MCP"
+
+**Reality**: They solve completely different problems. MCP connects agents to external systems. A2A connects agents to each other. Our negotiation simulator uses both simultaneously.
+
+### ❌ "A2A requires a framework"
+
+**Reality**: The simplest A2A is two Python functions calling each other. You don't need a framework. Add structure (message schemas, state machines) as complexity grows.
+
+### ❌ "Agents need equal capabilities to communicate"
+
+**Reality**: A simple rule-based agent can A2A communicate with a sophisticated GPT-4 agent. The protocol is the interface — not the intelligence behind it.
+
+### ❌ "A2A is only for multi-agent systems"
+
+**Reality**: A2A patterns also appear when a single agent communicates with itself across time (e.g., leaving a "message" for its next execution) or when an orchestrator delegates to specialized sub-agents.
+
+---
+
+# Part II — The A2A Protocol Spec (Deep-Dive)
+
+The first half of this document explains the *idea* of agent-to-agent
+communication. This part walks through the actual A2A specification.
+Pair each section with a runnable demo under
+[`a2a/demos/`](../a2a_demos/).
+
+To see the protocol live, start the agents with:
+```bash
+adk web --a2a adk/negotiation_agents/
+```
+
+Then run:
+```bash
+python a2a/demos/a2a_10_wire_lifecycle.py
+python a2a/demos/a2a_11_context_threading.py
+python a2a/demos/a2a_12_parts_and_artifacts.py
+python a2a/demos/a2a_13_orchestrated_negotiation.py   # polling + streaming
+python a2a/demos/a2a_14_error_handling.py
+```
+
+---
+
+## 12. Spec Overview & Versioning
+
+The A2A protocol (originally announced by Google in 2024 and now stewarded
+as an open spec) standardizes how *one agent service* talks to *another
+agent service* over the network. It is layered:
+
+```text
+┌──────────────────────────────────────────────────┐
+│  Application semantics (your offer/counter loop) │
+├──────────────────────────────────────────────────┤
+│  A2A object model: Task, Message, Part, Artifact │
+├──────────────────────────────────────────────────┤
+│  A2A JSON-RPC methods: message/send, ...         │
+├──────────────────────────────────────────────────┤
+│  HTTP/HTTPS  (with optional SSE streaming)       │
+└──────────────────────────────────────────────────┘
+```
+
+The spec version travels in the Agent Card (`protocolVersion`). Servers
+advertise it; clients should compare and refuse to interop with versions
+they don't understand. The workshop uses `"0.3.0"`.
+
+A2A is **not a replacement for MCP**. MCP is *agent ↔ tool*; A2A is
+*agent ↔ agent*. A single agent can be an A2A server *and* an MCP client
+at the same time — that's exactly what `adk web --a2a` does for our agents.
+
+---
+
+## 13. Agent Card
+
+The Agent Card is A2A's discovery contract. Clients fetch it from a
+well-known URL before sending any messages:
+
+```text
+GET /.well-known/agent-card.json
+```
+
+Minimum useful fields:
+
+| Field              | Purpose                                                       |
+|--------------------|---------------------------------------------------------------|
+| `name`             | Stable identifier for this agent.                             |
+| `description`      | Human-readable summary.                                       |
+| `url`              | Where to send JSON-RPC messages.                              |
+| `version`          | Agent implementation version (your code's version).           |
+| `protocolVersion`  | A2A spec version this agent speaks.                           |
+| `preferredTransport` | `"JSONRPC"` is the workshop default.                        |
+| `capabilities`     | `{streaming, pushNotifications, stateTransitionHistory, extensions}` — see §13.2. |
+| `skills`           | List of `AgentSkill` objects — what the agent can actually do.|
+| `defaultInputModes` / `defaultOutputModes` | Default MIME types for input/output. |
+| `provider`         | `{organization, url}` — who built/operates the agent.         |
+
+Each `AgentSkill` should have an `id`, `name`, `description`, `tags`,
+`examples`, and per-skill `inputModes`/`outputModes`. Skills are how a
+caller (human or another agent) decides whether your agent is a fit.
+
+With `adk web --a2a`, each agent's card is **read from its `agent.json`**
+(for example `negotiation_agents/seller_agent/agent.json`); agent folders
+without one aren't exposed over A2A. The card's `capabilities` matter: the
+A2A server refuses `message/stream` unless `streaming` is true, and refuses
+push-notification setup unless `pushNotifications` is true (§13.2).
+
+**Demo:** `a2a/demos/a2a_10_wire_lifecycle.py` fetches
+and prints the Agent Card before sending the first message.
+
+### 13.1 How clients find Agent Cards — discovery strategies and registries
+
+The A2A docs ([Agent Discovery](https://a2a-protocol.org/latest/topics/agent-discovery/))
+describe three strategies:
+
+| Strategy | How it works | In this workshop |
+|---|---|---|
+| **Well-known URI** | The agent serves its card at `https://{domain}/.well-known/agent-card.json`; a client that knows the domain fetches it | ✅ Every A2A demo fetches the card this way |
+| **Curated registry** (catalog-based) | Agents publish cards to a central registry; clients query it "by criteria like skills or tags" and get back matching cards | Not built — see below |
+| **Direct configuration** | The client is configured with URLs or cards (config files, env vars) | ✅ The base URLs in the demos (`--seller-url`, `--base-url`) are direct configuration |
+
+In the demos the agent's **base URL** is configured directly, and the
+**card** is discovered at the well-known path under it. A registry would
+replace the configured URL with a query ("find me an agent that can
+negotiate as a seller").
+
+**There is no standard registry API.** The A2A docs say so explicitly:
+"The current A2A specification does not prescribe a standard API for
+curated registries." Each registry has its own API and data model.
+
+Real registries you'll meet:
+
+| Registry | What it is | How you search it |
+|---|---|---|
+| **Google Cloud Agent Registry** ([docs](https://docs.cloud.google.com/agent-registry/overview)) | Managed catalog in a Google Cloud project for agents, MCP servers, skills and endpoints. Works with Agent Identity and Agent Gateway for runtime governance. Needs a project and IAM roles (e.g. `roles/agentregistry.viewer` to search); no local emulator | **Agents:** keyword search with `AND` / `OR` / `NOT`, matching metadata, description and the **A2A skills in the Agent Card** — `gcloud agent-registry agents search --search-string="flight OR booking"` — and prefix search such as `displayName:Best_A2A_*`. **Semantic** search (`--search-type=semantic`) is documented for registered *skills* (`SKILL.md` packages), not for agents |
+| **AGNTCY Agent Directory** ([github.com/agntcy/dir](https://github.com/agntcy/dir)) | Open source. Publishes and discovers agent records over a distributed peer-to-peer network (DHT), with cryptographic signing; records use the OASF schema rather than raw Agent Cards. CLI (`dirctl`) and Go/Python/JS SDKs; you run a directory node | **Capability-based** discovery: records describe skills in hierarchical taxonomies (OASF) and are matched by those attributes |
+| **MCP Registry** ([github.com/modelcontextprotocol/registry](https://github.com/modelcontextprotocol/registry)) | The official registry for **MCP servers** — "like an app store for MCP servers". Not for A2A agents; in preview (API frozen at v0.1) | Lists published MCP servers and their metadata |
+
+The search ideas recur across registries:
+
+| Search style | What it matches | Where it appears |
+|---|---|---|
+| **Tags / skills** (structured) | `skills[].tags`, skill names, or a skill taxonomy | A2A docs ("skills or tags"), AGNTCY (OASF taxonomy) |
+| **Keyword** with boolean operators | Name, description, skill text | Google Agent Registry agents |
+| **Prefix** | Start of a field, for autocomplete | Google Agent Registry (`displayName:...*`) |
+| **Semantic** (by meaning) | Embeddings of descriptions / instructions | Google Agent Registry *skills* |
+
+Whatever the registry, it returns an **Agent Card** (or a reference to
+one). The client then reads that card — `url`, `skills`, `capabilities`,
+`securitySchemes` — to decide how to call the agent. That's why rich,
+accurate skill descriptions and tags in your `agent.json` matter: they are
+what gets searched.
+
+### 13.2 Capabilities — all four, and what each one turns on
+
+`capabilities` is how an agent says which optional protocol features it
+supports. The A2A spec (v0.3.0, the version these agents speak) defines four:
+
+| Capability | Meaning (spec v0.3.0) | What it turns on | In this workshop |
+|---|---|---|---|
+| `streaming` | The agent supports Server-Sent Events for streaming responses | `message/stream` — the response is an SSE stream of task updates (§17.2). `tasks/resubscribe` reconnects to a task's stream | `seller_agent`: **true**. `buyer_agent`, `negotiation`: false. Demo 13 streams the seller; demo 14 shows the buyer refusing `message/stream` |
+| `pushNotifications` | The agent can send push notifications for asynchronous task updates | `tasks/pushNotificationConfig/set` / `get` / `list` / `delete`, and a webhook in `message/send`'s `configuration.pushNotificationConfig` (§17.3) | false on every card. Not demoed — ADK's built-in A2A server doesn't send pushes (§17.3). Demo 14 shows the buyer refusing push setup |
+| `stateTransitionHistory` | The agent provides a history of state transitions for a task | Informational — no method depends on it | Not set |
+| `extensions` | Protocol extensions the agent supports: `uri`, `description`, `required` (client must comply), `params` | Extension-specific. The a2a-sdk client sends the extensions it wants to use in an `X-A2A-Extensions` HTTP header | Not set |
+
+**What isn't a capability:** `message/send`, `tasks/get` and `tasks/cancel`
+are always part of the protocol, so **polling** (non-blocking `message/send`
++ `tasks/get`) works with any agent — that's how demo 13 gets the buyer's
+results. (`tasks/cancel` works with ADK's executor: a running task goes to
+`canceled` — demo 14.)
+
+**How strictly it's enforced (a2a-sdk 0.3.26 server):** only two methods
+check the card — `message/stream` (needs `streaming`) and
+`tasks/pushNotificationConfig/set` (needs `pushNotifications`). Both
+refusals come back as JSON-RPC error -32603 with a descriptive message
+(demo 14). `stateTransitionHistory` and `extensions` aren't checked.
+
+**The client side:** the a2a-sdk `Client` reads the card too. With
+`ClientConfig(streaming=True)` it uses `message/stream` only when
+`card.capabilities.streaming` is true, and falls back to `message/send`
+otherwise.
+
+Other card fields advertise features as well, outside `capabilities`:
+`securitySchemes` / `security` (how to authenticate — §18),
+`supportsAuthenticatedExtendedCard` (a fuller card is available from
+`agent/getAuthenticatedExtendedCard` after authenticating),
+`additionalInterfaces` (the same agent over other transports, e.g. gRPC),
+and `signatures` (a signed card).
+
+> Versions differ: the spec's gRPC definition of `AgentCapabilities` has
+> only `streaming`, `push_notifications` and `extensions`. Always read the
+> fields from the card you actually fetched.
+
+---
+
+## 14. Tasks, Messages, Parts, Artifacts
+
+Four object types describe everything that flows between agents.
+
+```text
+            Task                           ── one logical unit of work
+              │
+              ├── status      ──────────── { state: "working" | "completed" | "failed" | ... }
+              │
+              ├── history[]   ──────────── chronological list of Messages
+              │      │
+              │      ├── Message            ── one turn from buyer or seller
+              │      │     └── parts[]      ── one or more Parts
+              │      │           │
+              │      │           ├── TextPart   { text: "..." }
+              │      │           ├── DataPart   { data: { ... } }
+              │      │           └── FilePart   { file: { uri | bytes, mimeType } }
+              │
+              └── artifacts[]  ─────────── durable outputs of the Task
+                     └── Artifact { artifactId, name?, parts[] }
+```
+
+- **Task** — a single request the client made of the server, with a
+  lifecycle (next section). Tasks have an `id` and a `contextId` that lets
+  you thread several Tasks into one conversation.
+- **Message** — one turn. Has a `messageId`, `role` (`"user"` or
+  `"agent"`), and one or more `Part`s. The whole turn-by-turn history is
+  preserved on the Task.
+- **Part** — the atomic chunk of content. Three kinds: text, structured
+  data (JSON), file (URI or inline bytes).
+- **Artifact** — a durable output attached to the Task, identified by an
+  `artifactId` (a `name` is optional). Use this for things you want
+  clients to be able to fetch later — a final summary, a generated PDF, a
+  blob of structured analysis.
+
+ADK's A2A server turns the agent's final reply into one artifact (a
+`TextPart`, no `name`) when the task completes. The same text is also the
+last agent message in `history`; the artifact is the place to read it from.
+
+**Demos:** `a2a_10_wire_lifecycle.py` takes a returned Task apart field by
+field; `a2a_12_parts_and_artifacts.py` sends a multi-part message
+(TextPart + DataPart) and compares `history`, `status.message` and
+`artifacts`.
+
+---
+
+## 15. JSON-RPC Methods
+
+A2A uses JSON-RPC 2.0 over HTTP POST to the `url` from the Agent Card.
+
+| Method                | What it does                                                | Needs capability |
+|-----------------------|-------------------------------------------------------------|------------------|
+| `message/send`        | Send a message; response is the Task (final if `blocking: true`, else as it stands — usually `submitted`). | — |
+| `message/stream`      | Same input as `message/send`, but the response is an SSE stream of `TaskStatusUpdateEvent` and `TaskArtifactUpdateEvent`. | `streaming` |
+| `tasks/get`           | Fetch the current state of a Task by id (polling).          | — |
+| `tasks/cancel`        | Request cancellation of an in-flight Task.                  | — |
+| `tasks/resubscribe`   | Reconnect to the event stream of a running Task.            | `streaming` |
+| `tasks/pushNotificationConfig/set` / `get` / `list` / `delete` | Manage the webhook(s) for a Task's updates. | `pushNotifications` |
+| `agent/getAuthenticatedExtendedCard` | Fetch a fuller Agent Card after authenticating. | card field `supportsAuthenticatedExtendedCard` |
+
+The SDK server only enforces two of these against the card — see §13.2.
+
+The request envelope is plain JSON-RPC 2.0:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "req_abc123",
+  "method": "message/send",
+  "params": {
+    "message": {
+      "messageId": "msg_xyz",
+      "role": "user",
+      "parts": [{ "kind": "text", "text": "..." }]
+    }
+  }
+}
+```
+
+**Demo:** `a2a/demos/a2a_10_wire_lifecycle.py` builds
+this envelope by hand — no SDK helpers — so you can see the exact wire
+shape.
+
+**Demo (`tasks/get`):** `a2a_13_orchestrated_negotiation.py` polls the
+buyer: it sends `message/send` with `configuration.blocking: false` — the
+response comes back immediately with the task `submitted` — then calls
+`tasks/get`, pausing a second between calls, until the task reaches a final
+state. `a2a_11_context_threading.py` also calls `tasks/get` on an earlier
+round's finished task.
+
+---
+
+## 16. Task Lifecycle and Status Updates
+
+Every Task moves through states set by the server. The spec (v0.3.0)
+defines nine (`a2a.types.TaskState`):
+
+| State | Meaning (spec) | Kind |
+|---|---|---|
+| `submitted` | Submitted and awaiting execution | active |
+| `working` | The agent is actively working on it | active |
+| `input-required` | Paused, waiting for input from the user | interrupted — the client sends another message |
+| `auth-required` | Needs authentication to proceed | interrupted |
+| `completed` | Finished successfully | terminal |
+| `failed` | Failed due to an error during execution | terminal |
+| `canceled` | Canceled by the user | terminal |
+| `rejected` | Rejected by the agent and not started | terminal |
+| `unknown` | Unknown or indeterminate | — |
+
+The usual path is `submitted → working → completed` (or `failed`). Once a
+task is terminal it doesn't change; a follow-up message in the same
+`contextId` creates a new task (demo 11).
+
+In an a2a-sdk server you write yourself, the `AgentExecutor` moves the
+task along with `TaskUpdater` methods: `submit()`, `start_work()`,
+`update_status(...)`, `add_artifact(...)`, `complete()`, `failed()`,
+`cancel()`, `reject()`, `requires_input()`, `requires_auth()`. ADK's
+`A2aAgentExecutor` does this for you.
+
+ADK's A2A executor emits a `submitted` and then a `working` status update
+*before* the slow LLM/MCP run starts, so streaming clients see the agent is
+alive.
+
+**Demos:** `a2a_10_wire_lifecycle.py` takes a `completed` Task apart;
+`a2a_13_orchestrated_negotiation.py` shows the lifecycle as it happens (the
+buyer's task comes back `submitted` and is polled to `completed`; the
+seller's streamed updates are `working` events until `completed`);
+`a2a_14_error_handling.py` produces a `failed` task (a FilePart the model
+can't read) — no exception, the reason is in `status.message`.
+
+---
+
+## 17. Getting Results: Polling, Streaming and Push Notifications
+
+A task can take a while (the seller calls three MCP tools and an LLM
+before answering). A2A gives the client three ways to get the result:
+
+| Mechanism | How | Needs capability | Connection | In this workshop |
+|---|---|---|---|---|
+| **Polling** | `message/send` with `blocking: false` → task comes back at once; then `tasks/get` until a final state | none | A short request per check | Demo 13 — the buyer |
+| **Streaming** | `message/stream` → one HTTP response that stays open; the server sends each update as an SSE event | `streaming` | One long-lived connection | Demo 13 — the seller |
+| **Push notifications** | `message/send` (or `tasks/pushNotificationConfig/set`) with a webhook → the server POSTs each update to it | `pushNotifications` | None held open; the server calls you | Not demoed (§17.3) |
+
+(The simplest option of all is a *blocking* `message/send`: the response
+arrives when the task is finished. Demos 10–12 use it. It's fine for short
+tasks — demo 14 shows what happens when it isn't.)
+
+Rule of thumb: seconds → block or poll; want progress as it happens →
+stream; minutes, or the client may go away → push.
+
+### 17.1 Polling (`tasks/get`)
+
+The client sends `message/send` with `configuration.blocking: false`. The
+server creates the task, starts the work, and replies straight away with
+the task (state `submitted`). The client then calls `tasks/get` with the
+task's `id` until `status.state` is final (`completed`, `failed`,
+`canceled`, `rejected`). Polling needs no capability: `tasks/get` is
+always available. With the a2a-sdk: `ClientConfig(polling=True)`, then
+`client.get_task(TaskQueryParams(id=task.id))`.
+
+**Demo:** `a2a_13_orchestrated_negotiation.py` polls the buyer (whose card
+says `streaming: false`), once a second, printing each state change.
+
+### 17.2 Streaming (`message/stream`, Server-Sent Events)
+
+The client opens a single HTTP connection. The server flushes events as
+they happen:
+
+- `TaskStatusUpdateEvent` — state transitions (`working`, `completed`, ...).
+- `TaskArtifactUpdateEvent` — newly attached artifacts.
+- A final event with `final: true` when the task terminates.
+
+This is best for in-flight UX — show "Seller is thinking..." and then
+the final answer in the same connection.
+
+**Capability gating (`capabilities.streaming`).** Streaming is opt-in
+per agent. The Agent Card's `capabilities.streaming` field declares
+whether the server supports `message/stream`:
+
+```json
+{
+  "name": "seller_agent",
+  "url": "http://localhost:8000/a2a/seller_agent",
+  "capabilities": { "streaming": true, "pushNotifications": false },
+  "skills": [...]
+}
+```
+
+**If a client calls `message/stream` against a server with
+`capabilities.streaming: false`, the a2a-sdk server refuses it** — HTTP 200
+with a JSON-RPC error `{"code": -32603, "message": "Streaming is not supported
+by the agent"}` — and the server doesn't fall back to `message/send`.
+**Robust clients fetch the Agent Card first and check the capability.**
+The a2a-sdk `Client` does this for you; demo 13 makes the choice visible:
+
+```python
+card = await A2ACardResolver(httpx_client=http, base_url=seller_url).get_agent_card()
+if card.capabilities.streaming:
+    config = ClientConfig(httpx_client=http, streaming=True)                  # message/stream
+else:
+    config = ClientConfig(httpx_client=http, streaming=False, polling=True)   # message/send + tasks/get
+client = ClientFactory(config).create(card)
+```
+
+**Capabilities are the contract.** This applies to push notifications and
+any other capability the spec adds — always check the card before relying
+on a feature. (How strictly a server checks varies — see §13.2. The a2a-sdk
+handler checks `capabilities.pushNotifications` on
+`tasks/pushNotificationConfig/set`, but not on a `message/send` that
+carries a push config inline.)
+
+**Demo:** `a2a_13_orchestrated_negotiation.py` streams from the seller
+(whose card has `streaming: true`): the seller's MCP tool calls arrive as
+DataParts in `working` updates and print as they happen, then a
+`TaskArtifactUpdateEvent` with the reply, then `completed` with
+`final: true`. `a2a_14_error_handling.py` sends `message/stream` to the
+buyer (`streaming: false`) and prints the error above.
+
+### 17.3 Push notifications (webhooks)
+
+For long-running tasks the client doesn't want to keep a connection open
+for, A2A defines a `pushNotificationConfig` mechanism. The client supplies
+a webhook URL (and optional auth) and the server POSTs lifecycle events
+to it.
+
+In the a2a-sdk server, each POST body is the full Task (status, history,
+artifacts), and if the client supplied a `token` it comes back in an
+`X-A2A-Notification-Token` header so the webhook can reject POSTs that
+aren't from the server it registered with.
+
+**In this workshop:** push isn't demonstrated, and every agent card says
+`pushNotifications: false`. ADK's built-in A2A server (`adk web --a2a`,
+`to_a2a()` in ADK 2.11) stores push configs but has no push sender, so it
+never POSTs to a webhook. To push from an ADK agent you'd build the server
+yourself — the same `Runner` + `A2aAgentExecutor`, plus a2a-sdk's
+`DefaultRequestHandler` with a `BasePushNotificationSender`.
+
+---
+
+## 18. Authentication and Trust
+
+The protocol does not invent a new auth mechanism — it reuses HTTP
+standards. The Agent Card declares which schemes are accepted in
+`securitySchemes` (API key, HTTP bearer, OAuth 2.0, OpenID Connect, mutual
+TLS) and which are required in `security`. Clients pick one supported by
+both sides. An agent can also set `supportsAuthenticatedExtendedCard` and
+serve a fuller card — e.g. extra skills — from
+`agent/getAuthenticatedExtendedCard` to authenticated callers only.
+
+The workshop's agent cards declare no security schemes.
+
+For workshop servers we run on `127.0.0.1` with no auth — fine for a
+local demo, **never appropriate for production**. In production:
+
+- Issue per-caller credentials so you can revoke individual agents.
+- Combine A2A auth with rate limiting at the HTTP layer.
+- Use the `contextId` field plus your own session bookkeeping to prevent
+  one tenant's client from poking at another tenant's tasks.
+- For agent-initiated outbound calls, treat the *callee's* Agent Card as
+  untrusted input — don't blindly follow `url` to wherever it points
+  without your own egress allowlist.
+
+---
+
+## 19. A2A vs MCP Side-by-Side
+
+| Question                  | MCP                          | A2A                                |
+|---------------------------|------------------------------|------------------------------------|
+| Who talks to whom?        | Agent ↔ tool/server          | Agent ↔ agent                      |
+| Transport                 | stdio / Streamable HTTP      | HTTP(S) JSON-RPC (+ SSE streaming) |
+| Discovery                 | `tools/list`, `resources/list`, `prompts/list` | `GET /.well-known/agent-card.json` |
+| Unit of work              | A single tool call           | A `Task` with messages + artifacts |
+| Long-running              | Tool returns when done (progress notifications optional) | Task states; get results by polling, streaming or push (§17) |
+| Authn/z                   | Optional authorization spec (OAuth 2.1) for HTTP transports; stdio uses the environment | HTTP-standard auth declared in the card (`securitySchemes`) |
+| Conversation memory       | Host-side                    | `contextId` threads tasks together |
+| Best mental model         | "Function library on a wire" | "Agent as a microservice"          |
+
+A real production agent often plays both roles: an A2A server *to its
+clients*, an MCP host *to its tool servers*. Our seller is exactly that.
+
+
+
+| Concept | Key Takeaway |
+|---|---|
+| **A2A definition** | Autonomous agents communicating with each other |
+| **vs MCP** | MCP = agent to tools; A2A = agent to agent |
+| **Standards** | A2A is an open spec (v0.3.0 here); custom JSON schemas are still common in hand-built systems |
+| **Message schema** | Include identity, temporal context, intent, payload |
+| **State machine** | Track valid message transitions to prevent invalid moves |
+| **Transport** | In-process (simple), HTTP (microservices), MQ (production) |
+| **Error types** | Validation, reasoning, communication, deadlock |
+| **Production patterns** | Registry, Mediator, Delegation |
+
+---
+
+*← [MCP Deep Dive](../../mcp/notes/mcp_deep_dive.md)*
+*→ [Google ADK Overview](google_adk_overview.md)*

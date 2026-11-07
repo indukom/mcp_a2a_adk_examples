@@ -1,0 +1,34 @@
+# Environment & secrets
+.env
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ADK runtime
+.adk/
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+
+# Test artifacts (Playwright screenshots, snapshots, logs)
+tests/
+
+# Slide generation (one-off scripts, not part of the workshop)
+.slides/
+create_slides.py
+create_presentation.py
+run_all.ps1
+real-estate-negotiation-simulator.pptx
+real-estate-negotiation-simulator-v2.pptx
+workshop_slides.pptx
+workshop_slides_v2.pptx
+negotiation_workshop_presentation.pptx
+TALKING_SCRIPT.md
+SLIDE_SPEC.md
+AssignmentReviewScript.md

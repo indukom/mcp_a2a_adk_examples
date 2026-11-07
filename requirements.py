@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════════════
+# Real Estate Negotiation Workshop — Python Dependencies
+# ═══════════════════════════════════════════════════════════════════════
+#
+# INSTALL:
+#   pip install -r requirements.txt
+#
+# PYTHON VERSION: 3.10+ required (uses match statements, TypeAlias, etc.)
+#
+# EXTERNAL REQUIREMENTS (not pip):
+#   • Node.js 18+ (optional — only for the MCP Inspector below)
+#     Install: https://nodejs.org
+#   • MCP Inspector (optional — visual host GUI for browsing a server's
+#     tools/resources/prompts). Runs via npx, no install needed:
+#       npx @modelcontextprotocol/inspector python mcp/servers/inventory_server.py
+#
+# API KEYS NEEDED:
+#   Simple version: export OPENAI_API_KEY=sk-...
+#   ADK version:    export OPENAI_API_KEY=sk-...
+#   GitHub demo:    GITHUB_TOKEN=<real GitHub personal access token> in .env
+#                   (uses GitHub's hosted MCP server — no Node.js needed)
+#   Pricing server auth (--http) + ADK demo d02:
+#                   PRICING_JWT_SECRET in .env, then mint a token with
+#                   python utils/pricing_auth.py --role buyer --write-env
+# ═══════════════════════════════════════════════════════════════════════
+
+
+# ── MCP (Model Context Protocol) ────────────────────────────────────────────
+# Core MCP library — client and server (FastMCP included)
+# <2: mcp 2.x renamed FastMCP to MCPServer and breaks both workshop servers.
+mcp>=1.0.0,<2.0.0
+
+
+# ── LLM Providers ────────────────────────────────────────────────────────────
+
+# OpenAI — powers the simple Python agents (GPT-4o)
+openai>=1.40.0
+
+# Google ADK — powers the ADK agents (OpenAI-backed model runtime)
+# Tested with google-adk 2.11. <3: next major version not tested.
+google-adk>=2.11.0,<3.0.0
+
+# LiteLLM — required by ADK for provider-style model IDs (e.g., openai/gpt-4o)
+litellm>=1.84.0
+
+# Google Agent2Agent protocol SDK (true networked A2A)
+# <1: the A2A demos use the 0.3 API (pydantic types); a2a-sdk 1.x switches to
+# protobuf-based types. google-adk 2.x accepts both.
+a2a-sdk>=0.3.24,<1.0.0
+
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+
+# Pydantic — A2A message schema validation
+pydantic>=2.0.0
+
+
+# ── Async & HTTP ─────────────────────────────────────────────────────────────
+
+# httpx — async HTTP client (used internally by some libraries)
+httpx>=0.27.0
+
+# aiofiles — async file operations (optional, for logging)
+aiofiles>=23.0.0
+
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+
+# python-dotenv — load .env files for API keys
+python-dotenv>=1.0.0
+
+# PyJWT — signs/verifies the pricing MCP server's demo tokens (utils/pricing_auth.py)
+PyJWT>=2.8.0,<3.0.0
+
+# typing-extensions — backports of newer typing features
+typing-extensions>=4.0.0
+
+
+# ── Optional ─────────────────────────────────────────────────────────────────
+
+# rich — beautiful terminal output (optional, used in some demos)
+# rich>=13.0.0

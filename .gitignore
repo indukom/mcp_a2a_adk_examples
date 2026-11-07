@@ -16,6 +16,10 @@ __pycache__/
 # OS
 .DS_Store
 
+# Screenshots
+Screenshot *.png
+*.screenshot.png
+
 # Test artifacts (Playwright screenshots, snapshots, logs)
 tests/
 
